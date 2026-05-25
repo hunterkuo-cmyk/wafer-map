@@ -1,0 +1,614 @@
+
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>THK Wafer Map (Heatmap + IDW power/res + Point size)</title>
+  <style>
+    body{font-family:Segoe UI,Arial,"Microsoft JhengHei",sans-serif;margin:16px;color:#111;}
+    .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;}
+    .panel{min-width:360px;max-width:520px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin-bottom:12px;}
+    label{display:flex;gap:10px;align-items:center;margin:10px 0;flex-wrap:wrap;}
+    input[type="number"]{width:92px}
+    input[type="range"]{width:220px}
+    select{padding:4px}
+    canvas{border:1px solid #ddd;border-radius:12px;}
+    .muted{color:#555;font-size:12px;line-height:1.4}
+    .stat{font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap}
+    .btn{padding:8px 10px;border:1px solid #ccc;border-radius:10px;background:#fafafa;cursor:pointer}
+    .btn:hover{background:#f3f3f3}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .warn{color:#8a2d00}
+    hr{border:none;border-top:1px solid #eee;margin:10px 0}
+  </style>
+</head>
+<body>
+<h2>THK 圓形膜厚分布圖（Heatmap/IDW + 黑色量測點）</h2>
+
+<div class="row">
+  <div class="panel">
+    <div class="card">
+      <label><b>選擇 CSV：</b> <input id="file" type="file" accept=".csv,text/csv" /></label>
+
+      <div class="grid">
+        <label>Wafer 直徑：
+          <select id="diam">
+            <option value="300" selected>300 mm</option>
+            <option value="200">200 mm</option>
+          </select>
+        </label>
+
+        <label>座標旋轉（度）：
+          <input id="rot" type="number" value="0" step="1" />
+        </label>
+      </div>
+
+      <label><input id="showHeat" type="checkbox" checked /> 顯示 Heatmap（IDW 插值）</label>
+      <label><input id="showId" type="checkbox" /> 顯示點位編號</label>
+
+      <!-- ✅ 新增：顯示膜厚值 -->
+      <label><input id="showThk" type="checkbox" /> 顯示點位膜厚值</label>
+
+      <label><input id="autoScale" type="checkbox" /> 自動縮放到資料最大半徑（不以 wafer 半徑固定）</label>
+
+      <hr>
+
+      <!-- IDW power: slider + number sync -->
+      <label>
+        <b>IDW power (p)</b>
+        <input id="pRange" type="range" min="0.5" max="6" step="0.25" value="2" />
+        <input id="pNum" type="number" min="0.5" max="6" step="0.25" value="2" />
+        <span class="muted">p 越大越強調近點（更尖銳），p 越小越平滑</span>
+      </label>
+
+      <div class="grid">
+        <label><b>Heatmap 解析度</b>：
+          <select id="heatRes">
+            <option value="256">256（快）</option>
+            <option value="384" selected>384（推薦）</option>
+            <option value="512">512（細）</option>
+            <option value="640">640（更細/較吃 CPU）</option>
+          </select>
+        </label>
+
+        <label><b>Heatmap 不透明度</b>：
+          <input id="heatAlpha" type="range" min="0" max="1" step="0.05" value="0.75" />
+          <span id="heatAlphaTxt" class="muted">0.75</span>
+        </label>
+      </div>
+
+      <hr>
+
+      <!-- point size controls -->
+      <label>
+        <input id="autoPoint" type="checkbox" checked />
+        <b>點大小依點數自動調整</b>
+        <span class="muted">（49 點會更小、9 點會更大）</span>
+      </label>
+
+      <label>
+        <b>點位大小</b>
+        <input id="ptSizeRange" type="range" min="1" max="6" step="0.25" value="2" />
+        <input id="ptSizeNum" type="number" min="1" max="6" step="0.25" value="2" />
+        <span class="muted">此值做為「基準半徑」，自動模式會依點數縮放</span>
+      </label>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+        <button class="btn" id="png">下載 PNG</button>
+        <button class="btn" id="clear">清除</button>
+      </div>
+
+      <div id="note" class="muted" style="margin-top:10px"></div>
+      <div id="warn" class="muted warn"></div>
+    </div>
+
+    <div class="card">
+      <b>統計</b>
+      <div id="stats" class="stat">尚未載入資料</div>
+      <div class="muted">點顏色固定黑色；Heatmap 顏色代表膜厚（由低→高）。</div>
+    </div>
+  </div>
+
+  <div>
+    <canvas id="cv" width="900" height="900"></canvas>
+  </div>
+</div>
+
+<script>
+  // ===== DOM =====
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const fileInput = document.getElementById('file');
+
+  const diamSel = document.getElementById('diam');
+  const rotInput = document.getElementById('rot');
+
+  const showHeat = document.getElementById('showHeat');
+  const showId = document.getElementById('showId');
+  const showThk = document.getElementById('showThk'); // ✅ 新增
+  const autoScale = document.getElementById('autoScale');
+
+  const pRange = document.getElementById('pRange');
+  const pNum = document.getElementById('pNum');
+
+  const heatRes = document.getElementById('heatRes');
+  const heatAlpha = document.getElementById('heatAlpha');
+  const heatAlphaTxt = document.getElementById('heatAlphaTxt');
+
+  const autoPoint = document.getElementById('autoPoint');
+  const ptSizeRange = document.getElementById('ptSizeRange');
+  const ptSizeNum = document.getElementById('ptSizeNum');
+
+  const statsBox = document.getElementById('stats');
+  const noteBox = document.getElementById('note');
+  const warnBox = document.getElementById('warn');
+
+  // ===== state =====
+  let points = []; // {id, thk, x_mm, y_mm, unit, raw_x, raw_y}
+  let scale = { waferRadiusMm: 150, waferRadiusPx: 360, cx: 430, cy: 430 };
+  let hover = null;
+
+  // ===== helpers =====
+  function parseCSVLine(line){
+    const cols = [];
+    let cur = '', inQ = false;
+    for (let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch === '"'){ inQ = !inQ; continue; }
+      if(ch === ',' && !inQ){ cols.push(cur.trim()); cur=''; continue; }
+      cur += ch;
+    }
+    cols.push(cur.trim());
+    return cols;
+  }
+
+  function angstromToMm(a){ return a * 1e-7; } // 1 Å = 1e-7 mm
+
+  function extractXY(meta){
+    let s = meta;
+    if(s.includes('/')) s = s.split('/').slice(1).join('/');
+    const parts = s.split('|');
+    const x = parseFloat(parts[0]);
+    const y = parseFloat(parts[1]);
+    const unit = (parts[2]||'').toUpperCase();
+    return {x, y, unit};
+  }
+
+  function rotate(x, y, deg){
+    const r = deg * Math.PI / 180;
+    const c = Math.cos(r), s = Math.sin(r);
+    return { x: x*c - y*s, y: x*s + y*c };
+  }
+
+  function clamp01(t){ return Math.max(0, Math.min(1, t)); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  // blue → cyan → green → yellow → red
+  function colorRamp(t){
+    t = clamp01(t);
+    const stops = [
+      {t:0.00, c:[  0,  80,255]},
+      {t:0.25, c:[  0, 200,255]},
+      {t:0.50, c:[  0, 220, 80]},
+      {t:0.75, c:[255, 220,  0]},
+      {t:1.00, c:[255,   0,  0]},
+    ];
+    for(let i=0;i<stops.length-1;i++){
+      const a=stops[i], b=stops[i+1];
+      if(t>=a.t && t<=b.t){
+        const u = (t-a.t)/(b.t-a.t);
+        return [
+          Math.round(lerp(a.c[0], b.c[0], u)),
+          Math.round(lerp(a.c[1], b.c[1], u)),
+          Math.round(lerp(a.c[2], b.c[2], u)),
+        ];
+      }
+    }
+    return [255,0,0];
+  }
+
+  function computeStats(arr){
+    const n = arr.length;
+    const mean = arr.reduce((s,v)=>s+v,0)/n;
+    const min = Math.min(...arr), max = Math.max(...arr);
+    const varp = arr.reduce((s,v)=>s+(v-mean)*(v-mean),0)/n;
+    const std = Math.sqrt(varp);
+    const range = max-min;
+    const cv = (std/mean)*100;
+    return {n, mean, min, max, std, range, cv};
+  }
+
+  function setScale(){
+    const d = parseFloat(diamSel.value);
+    const waferRadiusMmFixed = d/2;
+    let waferRadiusMm = waferRadiusMmFixed;
+
+    if(points.length && autoScale.checked){
+      let maxR = 0;
+      for(const p of points){
+        const r = Math.hypot(p.x_mm, p.y_mm);
+        if(r>maxR) maxR = r;
+      }
+      waferRadiusMm = maxR * 1.05;
+    }
+
+    const pad = 80;
+    const minSide = Math.min(cv.width, cv.height);
+    const waferRadiusPx = (minSide/2) - 120;
+    scale = { waferRadiusMm, waferRadiusPx, cx: cv.width/2, cy: cv.height/2 };
+  }
+
+  function toPixel(x_mm, y_mm){
+    const px = scale.cx + (x_mm / scale.waferRadiusMm) * scale.waferRadiusPx;
+    const py = scale.cy - (y_mm / scale.waferRadiusMm) * scale.waferRadiusPx;
+    return {px, py};
+  }
+
+  function drawLegend(minV, maxV){
+    const margin = 50;
+    const w = 20, h = 300;
+
+    const x = cv.width - w - margin;
+    const y = margin;
+
+    const grad = ctx.createLinearGradient(0, y, 0, y+h);
+    for(let i=0;i<=100;i++){
+      const t = i/100;
+      const [r,g,b] = colorRamp(1-t);
+      grad.addColorStop(t, `rgb(${r},${g},${b})`);
+    }
+    ctx.fillStyle = grad;
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#333';
+    ctx.strokeRect(x, y, w, h);
+
+    ctx.fillStyle = '#111';
+    ctx.font = '12px Segoe UI, Arial';
+    ctx.fillText(`Max: ${maxV}`, x-6, y-10);
+    ctx.fillText(`Min: ${minV}`, x-6, y+h+18);
+  }
+
+  function drawBase(){
+    ctx.clearRect(0,0,cv.width,cv.height);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0,0,cv.width,cv.height);
+
+    // wafer circle
+    ctx.beginPath();
+    ctx.arc(scale.cx, scale.cy, scale.waferRadiusPx, 0, Math.PI*2);
+    ctx.fillStyle = '#fcfcfc';
+    ctx.fill();
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // crosshair
+    ctx.strokeStyle = '#bbb';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(scale.cx - scale.waferRadiusPx, scale.cy);
+    ctx.lineTo(scale.cx + scale.waferRadiusPx, scale.cy);
+    ctx.moveTo(scale.cx, scale.cy - scale.waferRadiusPx);
+    ctx.lineTo(scale.cx, scale.cy + scale.waferRadiusPx);
+    ctx.stroke();
+
+    // notch marker (bottom)
+    ctx.fillStyle = '#222';
+    ctx.beginPath();
+    ctx.arc(scale.cx, scale.cy + scale.waferRadiusPx, 5, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = '#444';
+    ctx.font = '12px Segoe UI, Arial';
+    ctx.fillText(`Wafer radius = ${scale.waferRadiusMm.toFixed(2)} mm`, 18, 24);
+  }
+
+  // ===== IDW =====
+  function idwAt(x, y, pts, power){
+    const p = Math.max(0.0001, power);
+    const p2 = p/2;
+    let num = 0, den = 0;
+    for(const t of pts){
+      const dx = x - t.x;
+      const dy = y - t.y;
+      const d2 = dx*dx + dy*dy;
+      if(d2 < 1e-12) return t.v;
+      const w = 1 / Math.pow(d2, p2);
+      num += w * t.v;
+      den += w;
+    }
+    return num / (den || 1);
+  }
+
+  function drawHeatmapLayer(rotDeg, minV, maxV){
+    if(!showHeat.checked || points.length === 0) return;
+
+    const res = parseInt(heatRes.value,10);
+    const pwr = parseFloat(pNum.value || '2');
+    const alpha = parseFloat(heatAlpha.value);
+
+    const pts = points.map(p=>{
+      const r = rotate(p.x_mm, p.y_mm, rotDeg);
+      return {x:r.x, y:r.y, v:p.thk};
+    });
+
+    const off = document.createElement('canvas');
+    off.width = res;
+    off.height = res;
+    const octx = off.getContext('2d', { willReadFrequently:true });
+    const img = octx.createImageData(res, res);
+
+    const cx = res/2, cy = res/2;
+    const Rpx = res/2;
+    const Rmm = scale.waferRadiusMm;
+
+    for(let j=0;j<res;j++){
+      const ypx = j - cy;
+      for(let i=0;i<res;i++){
+        const xpx = i - cx;
+        const rr = xpx*xpx + ypx*ypx;
+        const idx = (j*res + i)*4;
+
+        if(rr > Rpx*Rpx){
+          img.data[idx+3] = 0;
+          continue;
+        }
+
+        const x_mm = (xpx / Rpx) * Rmm;
+        const y_mm = (-ypx / Rpx) * Rmm;
+
+        const z = idwAt(x_mm, y_mm, pts, pwr);
+        const t = (z - minV) / (maxV - minV || 1);
+        const [r,g,b] = colorRamp(t);
+
+        img.data[idx+0] = r;
+        img.data[idx+1] = g;
+        img.data[idx+2] = b;
+        img.data[idx+3] = Math.round(alpha * 255);
+      }
+    }
+
+    octx.putImageData(img, 0, 0);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(scale.cx, scale.cy, scale.waferRadiusPx, 0, Math.PI*2);
+    ctx.clip();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(
+      off,
+      scale.cx - scale.waferRadiusPx,
+      scale.cy - scale.waferRadiusPx,
+      scale.waferRadiusPx*2,
+      scale.waferRadiusPx*2
+    );
+    ctx.restore();
+  }
+
+  // ===== point size =====
+  function getPointRadius(n){
+    const base = parseFloat(ptSizeNum.value || '2');
+    if(!autoPoint.checked) return base;
+    let r = base / Math.sqrt((n || 1)/25);
+    return Math.max(1.0, Math.min(6.0, r));
+  }
+
+  // ✅ 新增：膜厚字體大小自動縮放（依點數）
+  // 文字大小用 ctx.font 控制，文字繪製用 fillText()。[2](https://www.w3schools.com/TAgs/canvas_font.asp)[3](https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/fillText)
+  function getThkFontPx(n){
+    // 基準：25 點時約 12px；點越多字越小
+    const base = 12;
+    let f = base / Math.sqrt((n || 1)/25);
+
+    // 依 wafer 顯示大小稍微補償（畫面更大字可略大）
+    const k = (scale.waferRadiusPx / 320);
+    f = f * Math.max(0.9, Math.min(1.2, k));
+
+    // clamp：避免太小/太大
+    return Math.max(8, Math.min(16, f));
+  }
+
+  function drawPoints(rotDeg, minV, maxV){
+    drawLegend(minV, maxV);
+
+    const rPt = getPointRadius(points.length);
+    const thkFont = getThkFontPx(points.length);
+
+    for(const p of points){
+      const r0 = rotate(p.x_mm, p.y_mm, rotDeg);
+      const {px, py} = toPixel(r0.x, r0.y);
+
+      // black points
+      ctx.fillStyle = 'black';
+      ctx.beginPath();
+      ctx.arc(px, py, rPt, 0, Math.PI*2);
+      ctx.fill();
+
+      if(showId.checked){
+        ctx.fillStyle = '#111';
+        ctx.font = '11px Segoe UI, Arial';
+        ctx.fillText(String(p.id), px + 6, py - 6);
+      }
+
+      // ✅ 顯示膜厚值（THK）：來自 CSV 第2欄 thk [1](https://www.w3schools.com/TAgs/canvas_font.asp)
+      if(showThk.checked){
+        // 依象限偏移，讓文字往外側走，減少跟點/文字互擠
+        const dx = (r0.x >= 0) ? 6 : -6;
+        const dy = (r0.y >= 0) ? -10 : 14;
+
+        ctx.save();
+        ctx.fillStyle = '#111';
+        ctx.font = `${thkFont.toFixed(0)}px Consolas, monospace`; // 字體大小自動調整[2](https://www.w3schools.com/TAgs/canvas_font.asp)
+        ctx.textAlign = (dx > 0) ? 'left' : 'right';
+        ctx.textBaseline = 'alphabetic';
+
+        const label = Number.isFinite(p.thk) ? p.thk.toFixed(3) : String(p.thk);
+        ctx.fillText(label, px + dx, py + dy); // 文字繪製[3](https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/fillText)
+        ctx.restore();
+      }
+    }
+
+    // hover tooltip (nearest point)
+    if(hover){
+      const pad = 8;
+      const text = `#${hover.id}  THK=${hover.thk}\nX=${hover.x_mm.toFixed(2)}mm  Y=${hover.y_mm.toFixed(2)}mm`;
+      ctx.font = '12px Consolas, monospace';
+      const lines = text.split('\n');
+      const w = Math.max(...lines.map(l=>ctx.measureText(l).width)) + pad*2;
+      const h = lines.length*16 + pad*2;
+      let x = hover.mx + 14, y = hover.my + 14;
+      if(x + w > cv.width) x = cv.width - w - 8;
+      if(y + h > cv.height) y = cv.height - h - 8;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.fillRect(x,y,w,h);
+      ctx.fillStyle = '#fff';
+      for(let i=0;i<lines.length;i++){
+        ctx.fillText(lines[i], x+pad, y+pad + 14 + i*16);
+      }
+    }
+  }
+
+  function redraw(){
+    setScale();
+    drawBase();
+    heatAlphaTxt.textContent = Number(heatAlpha.value).toFixed(2);
+
+    if(!points.length){
+      statsBox.textContent = '尚未載入資料';
+      noteBox.textContent = '';
+      warnBox.textContent = '';
+      return;
+    }
+
+    const vals = points.map(p=>p.thk);
+    const st = computeStats(vals);
+    const minV = st.min, maxV = st.max;
+    const rotDeg = parseFloat(rotInput.value || '0');
+
+    drawHeatmapLayer(rotDeg, minV, maxV);
+    drawPoints(rotDeg, minV, maxV);
+
+    statsBox.textContent =
+`點數 n     : ${st.n}
+平均 mean : ${st.mean}
+最小 min  : ${st.min}
+最大 max  : ${st.max}
+Std (σ)   : ${st.std}
+Range     : ${st.range}
+CV%       : ${st.cv.toFixed(3)} %`;
+
+    noteBox.textContent = `已載入 ${points.length} 點。座標若標示 ANGSTROM，已自動換算 mm。`;
+    warnBox.textContent = '';
+
+    const d = parseFloat(diamSel.value);
+    const R = d/2;
+    let outCount = 0;
+    for(const p of points){
+      if(Math.hypot(p.x_mm, p.y_mm) > R*1.01) outCount++;
+    }
+    if(outCount>0 && !autoScale.checked){
+      warnBox.textContent = `注意：有 ${outCount} 點半徑超出 ${R}mm（可改 wafer 直徑或勾「自動縮放」）。`;
+    }
+  }
+
+  function loadText(text){
+    points = [];
+    const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length);
+    for(const line of lines){
+      const cols = parseCSVLine(line);
+      if(cols.length < 3) continue;
+
+      const id = parseInt(cols[0].replace(/"/g,''),10);
+      const thk = parseFloat(cols[1].replace(/"/g,''));
+      const meta = cols.slice(2).join(',').replace(/"/g,'');
+
+      if(!Number.isFinite(id) || !Number.isFinite(thk)) continue;
+
+      const {x, y, unit} = extractXY(meta);
+      if(!Number.isFinite(x) || !Number.isFinite(y)) continue;
+
+      let x_mm = x, y_mm = y;
+      if(unit.includes('ANGSTROM')){
+        x_mm = angstromToMm(x);
+        y_mm = angstromToMm(y);
+      }
+      points.push({id, thk, x_mm, y_mm, raw_x:x, raw_y:y, unit});
+    }
+
+    // ✅ 自動勾選 autoScale
+    autoScale.checked = true;
+
+    redraw();
+  }
+
+  // ===== sync helpers (slider <-> number) =====
+  function bindRangeNumber(rangeEl, numEl){
+    rangeEl.addEventListener('input', () => { numEl.value = rangeEl.value; redraw(); });
+    numEl.addEventListener('input', () => {
+      const v = Number(numEl.value);
+      if(Number.isFinite(v)){
+        numEl.value = v;
+        rangeEl.value = v;
+      }
+      redraw();
+    });
+  }
+
+  bindRangeNumber(pRange, pNum);
+  bindRangeNumber(ptSizeRange, ptSizeNum);
+
+  // ===== events =====
+  fileInput.addEventListener('change', async (e)=>{
+    const f = e.target.files?.[0];
+    if(!f) return;
+    const text = await f.text();
+    loadText(text);
+  });
+
+  // ✅ 新增 showThk 讓勾選時會重畫
+  [diamSel, rotInput, showHeat, showId, showThk, autoScale, heatRes, heatAlpha, autoPoint]
+    .forEach(el => el.addEventListener('input', redraw));
+
+  document.getElementById('png').addEventListener('click', ()=>{
+    const a = document.createElement('a');
+    a.download = 'wafer_thk_map_heat.png';
+    a.href = cv.toDataURL('image/png');
+    a.click();
+  });
+
+  document.getElementById('clear').addEventListener('click', ()=>{
+    points = [];
+    hover = null;
+    redraw();
+  });
+
+  cv.addEventListener('mousemove', (e)=>{
+    if(!points.length){ hover=null; redraw(); return; }
+    const rect = cv.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    const rotDeg = parseFloat(rotInput.value || '0');
+    let best = null, bestD = 1e9;
+
+    for(const p of points){
+      const r0 = rotate(p.x_mm, p.y_mm, rotDeg);
+      const {px, py} = toPixel(r0.x, r0.y);
+      const d = Math.hypot(px-mx, py-my);
+      if(d < bestD){
+        bestD = d;
+        best = { ...p, mx, my };
+      }
+    }
+    hover = (bestD <= 12) ? best : null;
+    redraw();
+  });
+
+  redraw();
+</script>
+</body>
+</html>
